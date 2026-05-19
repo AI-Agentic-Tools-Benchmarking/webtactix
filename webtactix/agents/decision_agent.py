@@ -15,6 +15,11 @@ from webtactix.workflows.execute import Executor
 from webtactix.datasets.webarena_evaluator import EvalResult
 from webtactix.preprocess.observation_encoder import ObservationEncoder, EncodedObservation
 
+# ── profiler ──────────────────────────────────────────────────────────────
+from webtactix.profiler import Profiler
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @dataclass(frozen=True)
 class DecisionResult:
     """
@@ -51,6 +56,7 @@ class DecisionAgent:
             sess: PlaywrightSession = None,
             rec: Recorder = None,
             cfg: Optional[DecisionAgentConfig] = None,
+            mode: str = "child",
     ) -> None:
         self.llm = llm
         self.q = q
@@ -62,6 +68,7 @@ class DecisionAgent:
         self.cfg = cfg or DecisionAgentConfig()
         self.queue = PriorityQueue()
         self.encoder = ObservationEncoder()
+        self.profiler = Profiler(mode)
 
     @staticmethod
     def _is_all_go_back(candidates: Sequence[NodeState]) -> bool:
@@ -103,6 +110,16 @@ class DecisionAgent:
             "Return JSON only."
         )
 
+        # ── PROFILER: preprocessing step ──────────────────────────────────
+        _sid_pre = self.profiler.emit_step_start(
+            stage         = "pre",
+            step_name     = f"pre:decision:reflect|parent={parent_node_id}",
+            agent         = "decision",
+            node_id       = str(parent_node_id),
+            input_summary = {"n_candidates": len(candidates), "queue_len": len(self.queue)},
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         payload = [self._candidate_payload(n, c) for n, c in zip(candidates, next_nodes)]
         payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
         hist, _ = self.tree.history_for_planner(parent_node_id)
@@ -131,7 +148,38 @@ class DecisionAgent:
         if len(self.queue) == 0:
             user += "Notice: Since the backtrace nodes are empty you can only explore parent."
 
+        # ── PROFILER: end preprocessing step ──────────────────────────────
+        self.profiler.emit_step_end(
+            _sid_pre,
+            output_summary = {"user_chars": len(user), "queue_len": len(self.queue)},
+        )
+        # ─────────────────────────────────────────────────────────────────
+
+        # ── PROFILER ──────────────────────────────────────────────────────
+        _cid = self.profiler.emit_llm_start(
+            step_name     = f"decision:reflect_or_reselect|parent={parent_node_id}",
+            model_name    = getattr(self.llm, "model", ""),
+            system_prompt = system,
+            user_prompt   = user,
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         obj, usage = await self.llm.chat_json(system=system, user=user)
+
+        # ── PROFILER ──────────────────────────────────────────────────────
+        self.profiler.emit_llm_end(_cid, step_name = f"decision:reflect_or_reselect|parent={parent_node_id}", usage=usage, output_obj=obj)
+        # ─────────────────────────────────────────────────────────────────
+
+        # ── PROFILER: postprocessing step — parse only, ends before any exec ─
+        _sid_post = self.profiler.emit_step_start(
+            stage         = "post",
+            step_name     = f"post:decision:reflect|parent={parent_node_id}",
+            agent         = "decision",
+            node_id       = str(parent_node_id),
+            input_summary = {"obj_type": type(obj).__name__},
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         explore_parent = True
         reflection = ""
         reason = ""
@@ -145,12 +193,38 @@ class DecisionAgent:
         if not explore_parent and len(self.queue) == 0:
             exp_flag = True
 
+        # ── PROFILER: end postprocessing step (before any exec spans) ─────
+        self.profiler.emit_step_end(
+            _sid_post,
+            output_summary = {"explore_parent": explore_parent or exp_flag, "reflection_chars": len(reflection)},
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         if explore_parent or exp_flag:
             selected = parent_node_id
             state = self.tree.state[selected]
             page = state.page
             print("[DECISION AGENT] explore parent")
+
+            # ── PROFILER: exec span for replay_to_node ────────────────────
+            _exec_replay = self.profiler.emit_exec_start(
+                exec_type  = "replay",
+                step_name  = f"exec:replay|node={parent_node_id}",
+                node_id    = str(parent_node_id),
+                action_sig = "replay_to_node",
+                url_before = self.tree.get_url(parent_node_id) or "",
+                plan_goal  = "replay to parent for replanning",
+            )
+            # ─────────────────────────────────────────────────────────────
             await self.executor.replay_to_node(page=page, node_id=parent_node_id)
+            # ── PROFILER: exec span end ───────────────────────────────────
+            self.profiler.emit_exec_end(
+                _exec_replay,
+                url_after = page.url,
+                success   = True,
+                kind      = "replay",
+            )
+            # ─────────────────────────────────────────────────────────────
 
             self.tree.state[parent_node_id].reflection.append(reflection)
             self.rec.save_decision(result={"kind": "reflect_and_replan", "reflection": reflection, "reason": reason},
@@ -162,14 +236,6 @@ class DecisionAgent:
 
         if chosen is None:
             raise EOFError
-            # self.rec.save_decision(result={"kind": "reflect_and_replan", "reflection": "", "reason": "Queue empty."},
-            #                        usage=usage)
-            # return DecisionResult(
-            #     kind="reflect_and_replan",
-            #     selected_node_id="v1",
-            #     new_child=['v1'],
-            #     reason=reason or "Queue empty.",
-            # )
 
         print("[DECISION AGENT] explore queue")
         exec_outcom = await self.executor.execute_next_plans(selected_node_id=chosen)
@@ -206,6 +272,16 @@ class DecisionAgent:
                 "Return JSON only."
             )
 
+            # ── PROFILER: preprocessing step ──────────────────────────────
+            _sid_pre = self.profiler.emit_step_start(
+                stage         = "pre",
+                step_name     = f"pre:decision:select|parent={parent_node_id}",
+                agent         = "decision",
+                node_id       = str(parent_node_id),
+                input_summary = {"n_candidates": len(viable)},
+            )
+            # ─────────────────────────────────────────────────────────────
+
             payload = [self._candidate_payload(n, c) for n, c in viable]
             payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
             hist, _ = self.tree.history_for_planner(parent_node_id)
@@ -237,7 +313,30 @@ class DecisionAgent:
                 f"{payload_json}\n"
             ])
 
+            # ── PROFILER: end preprocessing step ──────────────────────────
+            self.profiler.emit_step_end(
+                _sid_pre,
+                output_summary = {"n_candidates": len(viable), "user_chars": len(user)},
+            )
+            # ─────────────────────────────────────────────────────────────
+
+            # ── PROFILER ──────────────────────────────────────────────────
+            # NOTE: this block is inside `if len(next_nodes) > 1`.
+            # When there is only one candidate no LLM call is made,
+            # so no IPC events are emitted — correct behaviour.
+            _cid = self.profiler.emit_llm_start(
+                step_name     = f"decision:select_and_execute|parent={parent_node_id}",
+                model_name    = getattr(self.llm, "model", ""),
+                system_prompt = system,
+                user_prompt   = user,
+            )
+            # ─────────────────────────────────────────────────────────────
+
             obj, usage = await self.llm.chat_json(system=system, user=user)
+
+            # ── PROFILER ──────────────────────────────────────────────────
+            self.profiler.emit_llm_end(_cid, step_name = f"decision:select_and_execute|parent={parent_node_id}", usage=usage, output_obj=obj)
+            # ─────────────────────────────────────────────────────────────
 
             selected: str = ""
 
@@ -258,7 +357,20 @@ class DecisionAgent:
                 if c.node_id != selected:
                     self.queue.push(c.node_id)
         else:
+            # Only one candidate — pre step covers trivial selection + fake LLM.
+            # ── PROFILER: preprocessing step ──────────────────────────────
+            _sid_pre = self.profiler.emit_step_start(
+                stage         = "pre",
+                step_name     = f"pre:decision:select|parent={parent_node_id}",
+                agent         = "decision",
+                node_id       = str(parent_node_id),
+                input_summary = {"n_candidates": 1},
+            )
+            # ─────────────────────────────────────────────────────────────
+
             selected = next_nodes[0].node_id
+
+              
             reason = "This is the only option."
             usage = {
                 "prompt_tokens": 0,
@@ -267,13 +379,34 @@ class DecisionAgent:
                 "estimated": False,
                 "model": "Pass",
             }
+             # ── PROFILER: end preprocessing step (before fake LLM marker) ─
+            self.profiler.emit_step_end(
+                _sid_pre,
+                output_summary = {"selected_node": selected, "auto_selected": True},
+            )
+            # ─────────────────────────────────────────────────────────────            
+
         print(f'[DECISION] node {selected}')
         self.rec.save_decision(result={"kind": "select_and_execute", "selected": selected, "reason": reason, "extra_info": extra_info}, usage=usage)
         print(f'[DECISION] extra info: {extra_info}')
         exec_outcom = await self.executor.execute_next_plans(selected_node_id=selected)
+
+        # ── PROFILER: postprocessing step — starts AFTER executor returns ──
+        # The exec spans from execute_next_plans already captured browser time.
+        # This post step covers only result-routing (pure CPU, no overlap).
+        _sid_post = self.profiler.emit_step_start(
+            stage         = "post",
+            step_name     = f"post:decision:select|parent={parent_node_id}",
+            agent         = "decision",
+            node_id       = str(parent_node_id),
+            input_summary = {"selected_node": selected, "n_outcomes": len(exec_outcom)},
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         new_child = [out.new_node_id for out in exec_outcom if out.new_node_id]
         all_error = bool(exec_outcom) and all(o.kind == "error" for o in exec_outcom)
         if len(exec_outcom) and exec_outcom[0].kind == "finish":
+            self.profiler.emit_step_end(_sid_post, output_summary={"outcome": "finish"})
             return DecisionResult(kind="finish", reason=exec_outcom[0].executed_plan.goal, eval_result=exec_outcom[0].eval_result)
         elif len(exec_outcom) and all_error:
             state = self.tree.state[selected]
@@ -283,11 +416,14 @@ class DecisionAgent:
                 reflection += f"{out.action_sig}:\n {out.error}\n\n"
 
             state.reflection.append(reflection)
+            self.profiler.emit_step_end(_sid_post, output_summary={"outcome": "all_error", "new_child": selected})
             return DecisionResult(kind="select_and_execute", selected_node_id=parent_node_id, new_child=[selected],
                                   reason="All plans fail to execute.")
         if len(next_nodes) > 1:
+            self.profiler.emit_step_end(_sid_post, output_summary={"outcome": "select_and_execute", "new_child_count": len(new_child)})
             return DecisionResult(kind="select_and_execute", selected_node_id=selected, new_child=new_child, reason=reason)
         else:
+            self.profiler.emit_step_end(_sid_post, output_summary={"outcome": "single_candidate", "new_child_count": len(new_child)})
             return DecisionResult(kind="select_and_execute", selected_node_id=selected, new_child=new_child,
                                   reason="Only one node, no need to decide.")
 
@@ -295,11 +431,29 @@ class DecisionAgent:
         self,
         parent_node_id: NodeId,
     ) -> DecisionResult:
+        # ── PROFILER: preprocessing step ──────────────────────────────────
+        _sid_pre = self.profiler.emit_step_start(
+            stage         = "pre",
+            step_name     = f"pre:decision:run|parent={parent_node_id}",
+            agent         = "decision",
+            node_id       = str(parent_node_id),
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         children_node_id = list(self.tree.children_map.get(parent_node_id, []))
         candidates = [self.tree.state[nid] for nid in children_node_id]
         next_nodes = [self.tree.nodes[nid] for nid in children_node_id]
         self.rec.decision_begin()
-        if self._is_all_go_back(candidates):
+        _is_go_back = self._is_all_go_back(candidates)
+
+        # ── PROFILER: end preprocessing step ──────────────────────────────
+        self.profiler.emit_step_end(
+            _sid_pre,
+            output_summary = {"n_candidates": len(candidates), "is_all_go_back": _is_go_back},
+        )
+        # ─────────────────────────────────────────────────────────────────
+
+        if _is_go_back:
             return await self.reflect_or_reselect(
                 parent_node_id=parent_node_id,
                 candidates=candidates,

@@ -10,29 +10,34 @@ from webtactix.core.semantic_tree import SemanticTree
 from webtactix.core.schemas import NodeId
 from webtactix.agents.constraint_agent import Constraint
 from webtactix.runner.recorder import Recorder
+from browser_env.env_config import REDDIT, GITLAB, SHOPPING, SHOPPING_ADMIN, WIKIPEDIA
+
+# ── profiler ──────────────────────────────────────────────────────────────
+from webtactix.profiler import Profiler
+# ─────────────────────────────────────────────────────────────────────────────
 
 _ALLOWED_PLAN_NAMES = {"web_operation", "data_extraction", "partially_done", "go_back", "finish"}
 _ALLOWED_ACTIONS = {"click", "input", "select", "press_enter", "goto"}
 
-TIPS = '''
+TIPS = f'''
 - Date format in shopping-admin: **Month/Day/YYYY** (e.g., "1/31/2024").\n
 - Date format in gitlab: **Year-Month-Day** (e.g., "2024-01-01").\n
 - All the data on shopping website falls within the time span from January 1, 2022 to December 31, 2023.\n
 - All task can ONLY operate under the website as follow. Following URL shows the homepage of these websites.\n
-  1 REDDIT: http://127.0.0.1:9999\n
-  2 GITLAB: http://127.0.0.1:8023\n
-  3 SHOPPING: http://127.0.0.1:7770\n
+  1 REDDIT: {REDDIT}\n
+  2 GITLAB: {GITLAB}\n
+  3 SHOPPING: {SHOPPING}\n
   SHOPPING ACCOUNT: \n
         "username": "emma.lopez@gmail.com",\n
         "password": "Password.123",\n
-  4 SHOPPING_ADMIN: http://127.0.0.1:7780/admin ("username": "admin", "password": "admin1234")\n
-  5 OPENSTREETMAP: https://127.0.0.1:3000 (For map task, you can use your external knowledge.)\n
-  6 wikipedia: http://127.0.0.1:8888/wikipedia_en_all_maxi_2022-05/A/User:The_other_Kiwix_guy/Landing\n
+  4 SHOPPING_ADMIN: {SHOPPING_ADMIN} ("username": "admin", "password": "admin1234")\n
+  5 OPENSTREETMAP: https://www.openstreetmap.org/ (For map task, you can use your external knowledge.)\n
+  6 wikipedia: {WIKIPEDIA}\n
 - Never click link or elements like <Download> or <Export> or <log out>, which will download sth on local that is forbid.\n
 - Brand and product type can be infer from product name. All reviews can be found under Marketing section.\n
 - The descending order(↓) for 'purchase dates' means that the earlier dates(oldest) are located at the top, newest at the bottom.\n
 - Ask for product recommendations, should posts new comments or submissions for the product\n
-- In GitLab, the edit page(including license) can be accessed via the URL pattern `http://127.0.0.1:8023/-/edit/master/<file>`)\n
+- In GitLab, the edit page(including license) can be accessed via the URL pattern `{GITLAB}/-/edit/master/<file>`)\n
 '''
 
 def _infer_type_from_name(name: str) -> str:
@@ -86,6 +91,7 @@ class PlannerAgent:
             tree: SemanticTree = None,
             rec: Recorder = None,
             cfg: Optional[PlannerAgentConfig] = None,
+            mode: str = "child",
     ) -> None:
         self.llm = llm
         self.q = q
@@ -93,8 +99,19 @@ class PlannerAgent:
         self.tree = tree
         self.rec = rec
         self.cfg = cfg or PlannerAgentConfig()
+        self.profiler = Profiler(mode)
 
     async def run(self, node_id: NodeId, _round: int) -> PlanningResult:
+        # ── PROFILER: preprocessing step ──────────────────────────────────
+        _sid_pre = self.profiler.emit_step_start(
+            stage         = "pre",
+            step_name     = f"pre:planner|round={_round}|node={node_id}",
+            agent         = "planner",
+            node_id       = str(node_id),
+            input_summary = {"round": _round},
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         st = self.tree.state.get(node_id)
         parent_id = self.tree.parent.get(node_id, None)
         parent_st = self.tree.state.get(parent_id, None)
@@ -159,34 +176,23 @@ class PlannerAgent:
             "3) partially_done\n"
             "   - Use this when you found important information or partially completed the task. With this type, you can compress the complex historical records into a concise completed description, along with the tasks that still need to be accomplished below.\n"
             "   - A typical usage scenario is a multi-stage task. Once a stage is completed, the completed part can be summarized. \n"
-            "   - When use this plan, leave step empty and write in goal, the completed part must be ground truth and cannot be changed.\n"
-            "   - Example: (1) We have already obtained the xxx information, next we will xxx based on this information. (2) We have already finish book a hotel(time), next we will buy ticket before the time."
-            "4) go_back\n"
-            "   - Use when the current page does not support useful actions for progress.\n"
-            "   - If you want to go to previous page, please use category web operation's goto action.\n"
-            "   - Output exactly ONE plan. Leave steps empty.\n"
-            "5) finish\n"
-            "   - Use when you can obtained the final answer from history and current observation or task completed.\n"
-            "   - Output exactly ONE plan with the final answer in goal, only contain <the direct answer> without explanation or other text.\n"
-            "TIPS: \n"
-            "- Stop as soon as the user's request is satisfied (“good-enough” is correct).\n"
-            "- If the user asks for ONE item/example, return the first valid match and DO NOT continue searching or comparing.\n"
-            "- Do not apply extra filters or open extra details unless needed to produce the requested answer.\n"
-            "- Do not verify across multiple candidates unless the user explicitly asks for “best / all / compare / exhaustive”.\n"
-            "- For user task of <Viewing/showing/display/browse/get report/find out> or other similar task, just present the content the user needs on the page and describe what needs to do on this page is fine, never make unnecessary actions(extraction, page by page examine...).\n"
-            "- If the relevant entries that meet the criteria have already been displayed on the webpage, there is no need to perform the filtering process.\n"
-            "- Sometimes exact filters are not exist, you can make some deduction to identify the constraints instead of evidence.\n"
-            "- 0, N/A, not found or unavaliable can also be consider as answer or result. \n"
-            "- For user task, you can also use the external knowledge that you already knew.\n"
-            f"{TIPS}\n\n"
-            "User's task:\n"
-            f"{self.q}\n\n"
         )
-        if self.constraints:
-            user += "Constraints:\n" + "\n".join(f"- [{c.kind}] {c.text}" for c in self.constraints) + "\n\n"
 
-        if history_text.strip():
-            user += "History Actions you have done (older to newer):\n" + history_text.strip() + "\n\n"
+        if self.constraints:
+            user += (
+                "Constraints (must be satisfied by the final answer):\n"
+                + "\n".join(f"- [{c.kind}] {c.text}" for c in self.constraints)
+                + "\n\n"
+            )
+
+        user += (
+            f"Task:\n{self.q}\n\n"
+            "TIPS:\n"
+            f"{TIPS}\n\n"
+        )
+
+        if len_hist > 0:
+            user += f"History (older to newer):\n{history_text}\n\n"
         else:
             user += "History (older to newer):\n This is the start website, no actions have been done before. You should make progress on the current page.\n\n"
 
@@ -218,7 +224,43 @@ class PlannerAgent:
 
         self.rec.plan_begin(node_id)
 
+        # ── PROFILER: end preprocessing step ──────────────────────────────
+        self.profiler.emit_step_end(
+            _sid_pre,
+            output_summary = {
+                "history_turns":  len_hist,
+                "prompt_chars":   len(system) + len(user),
+                "has_reflection": bool(len(st.reflection)),
+            },
+        )
+        # ─────────────────────────────────────────────────────────────────
+
+        # ── PROFILER: record start ────────────────────────────────────────
+        # step_name encodes round + node so every call is uniquely
+        # identifiable in the DB without joining any other table.
+        _cid = self.profiler.emit_llm_start(
+            step_name     = f"planner|round={_round}|node={node_id}",
+            model_name    = getattr(self.llm, "model", ""),
+            system_prompt = system,
+            user_prompt   = user,
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         obj, usage = await self.llm.chat_json(system=system, user=user)
+
+        # ── PROFILER: record end with exact token counts from usage ───────
+        self.profiler.emit_llm_end(_cid, step_name = f"planner|round={_round}|node={node_id}", usage=usage, output_obj=obj)
+        # ─────────────────────────────────────────────────────────────────
+
+        # ── PROFILER: postprocessing step ─────────────────────────────────
+        _sid_post = self.profiler.emit_step_start(
+            stage         = "post",
+            step_name     = f"post:planner|round={_round}|node={node_id}",
+            agent         = "planner",
+            node_id       = str(node_id),
+            input_summary = {"obj_type": type(obj).__name__},
+        )
+        # ─────────────────────────────────────────────────────────────────
 
         page_summary = ""
         progress_analysis = ""
@@ -347,5 +389,14 @@ class PlannerAgent:
 
         self.rec.save_plan(node_id=node_id, result=planning_result, usage=usage)
 
-        return planning_result
+        # ── PROFILER: end postprocessing step ─────────────────────────────
+        self.profiler.emit_step_end(
+            _sid_post,
+            output_summary = {
+                "valid_plans": len(plans),
+                "plan_names":  [p.name for p in plans],
+            },
+        )
+        # ─────────────────────────────────────────────────────────────────
 
+        return planning_result

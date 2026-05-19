@@ -14,22 +14,28 @@ from webtactix.browser.playwright_session import PlaywrightSession, wait_for_pag
 import sys
 import subprocess
 
+# ── profiler ──────────────────────────────────────────────────────────────
+from webtactix.profiler import Profiler
+from browser_env.env_config import REDDIT, GITLAB, SHOPPING, SHOPPING_ADMIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @dataclass
 class DataExtractionAgentConfig:
     max_rounds: int = 20
     max_history_items: int = 20
     max_steps_per_round: int = 8
 
-external_knowledge = '''
+external_knowledge = f'''
 - Date format: **Month/Day/YYYY** (e.g., "1/31/2024").
 - Brand and product type can be infer from product name.
 - 0 or not found can also be a result.
 - The descending order for dates means that the earlier dates are located at the top, you must combined with the table to verify.\n
 - All task can ONLY operate under the website as follow. Following URL shows the homepage of these websites.
-  1 REDDIT: http://127.0.0.1:9999
-  2 GITLAB: http://127.0.0.1:8023
-  3 SHOPPING: http://127.0.0.1:7770
-  4 SHOPPING_ADMIN: http://127.0.0.1:7780
+  1 REDDIT: {REDDIT}
+  2 GITLAB: {GITLAB}
+  3 SHOPPING: {SHOPPING}
+  4 SHOPPING_ADMIN: {SHOPPING_ADMIN}
   5 OPENSTREETMAP: https://www.openstreetmap.org/ (For map task, you can use your external knowledge.)
 '''
 
@@ -61,6 +67,7 @@ class DataExtractionAgent:
         sess: PlaywrightSession,
         rec: Recorder,
         cfg: Optional[DataExtractionAgentConfig] = None,
+        mode: str = "child",
     ) -> None:
         self.task = task
         self.llm = llm
@@ -69,6 +76,7 @@ class DataExtractionAgent:
         self.rec = rec
         self.encoder = ObservationEncoder(ObservationEncoderConfig(table_max_rows=1e10))
         self.cfg = cfg or DataExtractionAgentConfig()
+        self.profiler = Profiler(mode)
 
     async def run(
         self,
@@ -81,6 +89,17 @@ class DataExtractionAgent:
         if getattr(node_state, "next_plans", None):
             p0 = node_state.next_plans[0] if len(node_state.next_plans) > 0 else None
             goal = (getattr(p0, "goal", "") or "").strip()
+
+        # ── PROFILER: exec span for initial navigation + replay ───────────
+        _exec_setup = self.profiler.emit_exec_start(
+            exec_type  = "data_setup",
+            step_name  = f"exec:data_setup|node={node_id}",
+            node_id    = str(node_id),
+            action_sig = f"goto {node_state.url}",
+            url_before = "",
+            plan_goal  = goal,
+        )
+        # ─────────────────────────────────────────────────────────────────
 
         page = await self.sess.new_page()
         await self.sess.goto(page, node_state.url)
@@ -102,6 +121,16 @@ class DataExtractionAgent:
                     print("[DATA][replay_err]", e)
                     break
 
+        # ── PROFILER: end setup exec span ─────────────────────────────────
+        self.profiler.emit_exec_end(
+            _exec_setup,
+            url_after    = page.url,
+            steps_count  = 1,
+            success      = True,
+            kind         = "data_setup",
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         notes: List[str] = []
         hist: List[str] = []  # alternating entries: NOTE: ... / ACTION: ...
         answer = ""
@@ -109,17 +138,64 @@ class DataExtractionAgent:
         page_initial = await self.sess.get_snapshot(page)
         enc_initial = self.encoder.encode(cur_snapshot=page_initial)
         common_hist, _ = self.tree.history_for_planner(node_id)
+
+        system = self._system_prompt()   # constant — build once outside loop
+
         for turn_idx in range(self.cfg.max_rounds):
             print('[DATA EXTRACTION] ', turn_idx)
             await wait_for_page_stable(page)
             cur = await self.sess.get_snapshot(page)
             enc = self.encoder.encode(cur_snapshot=cur)
 
-            # 1) LLM decides: record key info + next actions OR done with final extraction
-            obj, usage = await self.llm.chat_json(
-                system=self._system_prompt(),
-                user=self._user_prompt(goal=goal, enc=enc, common_history=common_hist, history=hist, url=page.url),
+            # ── PROFILER: preprocessing step ──────────────────────────────
+            _sid_pre = self.profiler.emit_step_start(
+                stage         = "pre",
+                step_name     = f"pre:data|turn={turn_idx}|node={node_id}",
+                agent         = "data",
+                node_id       = str(node_id),
+                input_summary = {"turn": turn_idx, "hist_len": len(hist), "actree_chars": len(enc.actree_yaml)},
             )
+            # ─────────────────────────────────────────────────────────────
+
+            user = self._user_prompt(
+                goal=goal, enc=enc, common_history=common_hist,
+                history=hist, url=page.url,
+            )
+
+            # ── PROFILER: end preprocessing step ──────────────────────────
+            self.profiler.emit_step_end(
+                _sid_pre,
+                output_summary = {"user_chars": len(user)},
+            )
+            # ─────────────────────────────────────────────────────────────
+
+            # ── PROFILER: record start of this extraction turn ────────────
+            # step_name encodes turn index + node_id so every loop
+            # iteration is individually queryable in the DB.
+            _cid = self.profiler.emit_llm_start(
+                step_name     = f"data|turn={turn_idx}|node={node_id}",
+                model_name    = getattr(self.llm, "model", ""),
+                system_prompt = system,
+                user_prompt   = user,
+            )
+            # ─────────────────────────────────────────────────────────────
+
+            # 1) LLM decides: record key info + next actions OR done with final extraction
+            obj, usage = await self.llm.chat_json(system=system, user=user)
+
+            # ── PROFILER: record end with exact usage ─────────────────────
+            self.profiler.emit_llm_end(_cid, usage=usage, output_obj=obj)
+            # ─────────────────────────────────────────────────────────────
+
+            # ── PROFILER: postprocessing step ─────────────────────────────
+            _sid_post = self.profiler.emit_step_start(
+                stage         = "post",
+                step_name     = f"post:data|turn={turn_idx}|node={node_id}",
+                agent         = "data",
+                node_id       = str(node_id),
+                input_summary = {"obj_type": type(obj).__name__, "turn": turn_idx},
+            )
+            # ─────────────────────────────────────────────────────────────
 
             parsed = self._parse_llm(obj)
             note = parsed.get("note", "").strip()
@@ -146,17 +222,50 @@ class DataExtractionAgent:
             if parsed.get("done", False):
                 answer = (parsed.get("answer", "") or "").strip()
                 done = True
+                # ── PROFILER: end postprocessing step ─────────────────────
+                self.profiler.emit_step_end(
+                    _sid_post,
+                    output_summary = {"is_done": True, "answer_chars": len(answer), "note_chars": len(note)},
+                )
+                # ─────────────────────────────────────────────────────────
                 break
 
             step = parsed.get("step", {})
             if not step:
                 # no steps and not done: stop to avoid infinite loop
+                # ── PROFILER: end postprocessing step ─────────────────────
+                self.profiler.emit_step_end(
+                    _sid_post,
+                    output_summary = {"is_done": False, "no_step": True, "note_chars": len(note)},
+                )
+                # ─────────────────────────────────────────────────────────
                 break
 
+            # ── PROFILER: end postprocessing step (action determined) ──────
+            self.profiler.emit_step_end(
+                _sid_post,
+                output_summary = {"is_done": False, "action": step.get("action", ""), "note_chars": len(note)},
+            )
+            # ─────────────────────────────────────────────────────────────
+
+            action_sig = ""
             if step['action'] == "go_back":
+                # ── PROFILER: exec span for go_back ───────────────────────
+                _exec_act = self.profiler.emit_exec_start(
+                    exec_type  = "data_action",
+                    step_name  = f"exec:data_action|turn={turn_idx}|node={node_id}",
+                    node_id    = str(node_id),
+                    action_sig = "go_back",
+                    url_before = page.url,
+                    plan_goal  = goal,
+                )
+                # ─────────────────────────────────────────────────────────
                 await page.go_back()
                 action_sig = "go back"
                 hist.append(f"ACTION: GO BACK")
+                # ── PROFILER: end exec span ───────────────────────────────
+                self.profiler.emit_exec_end(_exec_act, url_after=page.url, steps_count=1, success=True, kind="go_back")
+                # ─────────────────────────────────────────────────────────
 
             elif step['action'] == "wait":
                 await asyncio.sleep(30)
@@ -170,11 +279,24 @@ class DataExtractionAgent:
                 role_nth = enc.role_nums[idx]
                 action = ActionStep(index=idx, action=ActionType.CLICK, role=role, name=name_, nth=nth, role_nth=role_nth)
                 action_sig = self._sig_from_steps(action)
+                # ── PROFILER: exec span for click ─────────────────────────
+                _exec_act = self.profiler.emit_exec_start(
+                    exec_type  = "data_action",
+                    step_name  = f"exec:data_action|turn={turn_idx}|node={node_id}",
+                    node_id    = str(node_id),
+                    action_sig = action_sig,
+                    url_before = page.url,
+                    plan_goal  = goal,
+                )
+                # ─────────────────────────────────────────────────────────
                 try:
                     await self.sess.apply_step(page, action, False)
 
                     hist.append(f"ACTION: {action_sig}")
                     print(f'[DATA AGENT] Click successful: {action_sig}')
+                    # ── PROFILER: end exec span ───────────────────────────
+                    self.profiler.emit_exec_end(_exec_act, url_after=page.url, steps_count=1, success=True, kind="click")
+                    # ─────────────────────────────────────────────────────
                 except Exception as e:
                     error_type = type(e).__name__
                     error_msg = str(e)
@@ -182,15 +304,31 @@ class DataExtractionAgent:
                     hist.append(f"ERROR: {error_sig}")
                     print(f'[DATA AGENT ERROR] {error_sig}')
                     action_sig = f"{action_sig} failed: {error_type}: {error_msg}"
+                    # ── PROFILER: end exec span (error) ───────────────────
+                    self.profiler.emit_exec_end(_exec_act, url_after=page.url, steps_count=1, success=False, error=error_sig, kind="click")
+                    # ─────────────────────────────────────────────────────
 
             elif step['action'] == "goto":
+                URL = step.get("URL", "about:blank")
+                # ── PROFILER: exec span for goto ──────────────────────────
+                _exec_act = self.profiler.emit_exec_start(
+                    exec_type  = "data_action",
+                    step_name  = f"exec:data_action|turn={turn_idx}|node={node_id}",
+                    node_id    = str(node_id),
+                    action_sig = f"goto {URL}",
+                    url_before = page.url,
+                    plan_goal  = goal,
+                )
+                # ─────────────────────────────────────────────────────────
                 try:
-                    URL = step.get("URL", "about:blank")
                     await page.goto(URL, timeout=60000)
                     await wait_for_page_stable(page)
                     action_sig = f"goto {URL}"
                     hist.append(f"ACTION: GOTO {URL}")
                     print(f'[DATA AGENT] goto {URL}')
+                    # ── PROFILER: end exec span ───────────────────────────
+                    self.profiler.emit_exec_end(_exec_act, url_after=page.url, steps_count=1, success=True, kind="goto")
+                    # ─────────────────────────────────────────────────────
                 except Exception as e:
                     error_type = type(e).__name__
                     error_msg = str(e)
@@ -198,9 +336,11 @@ class DataExtractionAgent:
                     hist.append(f"ERROR: {error_sig}")
                     print(f'[DATA AGENT ERROR] {error_sig}')
                     action_sig = f"ERROR: {error_sig}"
+                    # ── PROFILER: end exec span (error) ───────────────────
+                    self.profiler.emit_exec_end(_exec_act, url_after=page.url, steps_count=1, success=False, error=error_sig, kind="goto")
+                    # ─────────────────────────────────────────────────────
 
             elif step['action'] == "code":
-                # analyze = parsed.get("analyze", "").strip()
                 raw = step.get("executable_code", "") or ""
                 code = self._strip_code_fence(raw)
 
@@ -290,11 +430,10 @@ class DataExtractionAgent:
             "answer's Rules:\n"
             "- Set done=true to give the final output and put the final answer and its explanation in 'answer'.\n"
             "- If the task cannot be completed correctly within current page(The details or editing page, which is a derivative of the current page, is also considered part of the current page.) because extra information or other navigation need to be acted, set done=true and explain(must mention cannot be done just in current page, not a negation of the entire task ). \n"
-            "- If completing the task would require an unreasonable amount of repetitive clicking or navigation, for example more than 10 items to open one by one, set done=true and explain in answer. \n"
+            "- If completing the task would require an unreasonable amount of repetitive clicking or navigation, for example more than 10 items to open one by one, set done=true and explain. \n"
             "- If the task requires obtaining the answer from an extremely long table(>100 rows) and it is clearly possible to set up a filter to optimize the extraction process, set done=true and explain in answer. You can't set filters yourself\n"
             "- If you want to apply filters, set done=true and ask PLANNER to do this in 'answer'.\n\n"
             "- If the output result is more than 10, only the URL(display on the browser) where the result is located and a description are required.\n\n"
-            # f"TIPS:\n {external_knowledge}\n\n"
             f"History (older to newer):\n{h}\n\n"
             "actree:\n"
             f"{enc.actree_yaml}\n\n"

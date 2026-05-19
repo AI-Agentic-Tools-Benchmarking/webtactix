@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
+from openai import AsyncOpenAI, OpenAI
 import tiktoken
-from openai import AsyncOpenAI
+#from openai import AsyncOpenAI
 
 
 @dataclass(frozen=True)
@@ -44,8 +45,15 @@ class OpenAICompatClient:
             try:
                 resp = await self._client.chat.completions.create(
                     model=model,
-                    temperature=temp,
-                    messages=messages,
+                    temperature=0,
+                    seed=42,
+                    top_p=1.0,
+                    max_tokens=8192,
+                    extra_body={"top_k": 1},
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user},
+                    ],
                 )
             except Exception as e:
                 print('[LLM ERR]', e)
